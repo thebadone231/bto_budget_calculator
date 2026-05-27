@@ -1241,14 +1241,14 @@ def render_timing_tab(config: dict):
     is_dia = config["payment_scheme"] == "dia"
 
     horizon_min = 36 if is_dia else 12
-    if "timing_horizon" in st.session_state and st.session_state.timing_horizon < horizon_min:
+    if "timing_horizon" not in st.session_state:
         st.session_state.timing_horizon = horizon_min
-    horizon_default = max(horizon_min, st.session_state.get("timing_horizon", horizon_min))
+    elif st.session_state.timing_horizon < horizon_min:
+        st.session_state.timing_horizon = horizon_min
     planning_horizon = st.slider(
         "Planning Horizon (months)",
         min_value=horizon_min,
         max_value=60,
-        value=horizon_default,
         step=6,
         key="timing_horizon",
     )
