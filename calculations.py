@@ -6,7 +6,10 @@ and affordability analysis.
 """
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Optional
+
+from dateutil.relativedelta import relativedelta
 
 from constants import (
     HDB_INTEREST_RATE,
@@ -14,10 +17,12 @@ from constants import (
     LTV_LIMIT,
     MSR_LIMIT,
     HDB_INCOME_CEILING,
+    PAYMENT_SCHEMES,
     get_cpf_rates,
     get_expense_benchmark,
     calculate_stamp_duty,
     calculate_hdb_legal_fees,
+    get_ehg_amount,
 )
 
 
@@ -73,6 +78,39 @@ class SavingsHealthCheck:
     message: str
     suggested_savings: float
     take_home_income: float
+
+
+@dataclass
+class TimingAnalysisPoint:
+    """A single point in the EHG vs loan timing analysis."""
+    application_date: date
+    assessed_income: float
+    ehg_amount: int
+    max_hdb_loan: float
+    loan_needed: float
+    loan_shortfall: float   # max(0, loan_needed - max_hdb_loan)
+    cash_needed: float      # flat_price - max_hdb_loan - ehg + stamp_duty + legal_fees
+    ehg_eligible: bool      # whether 12-month employment (14 months before application) requirement is met
+
+
+@dataclass
+class PaymentPhaseBreakdown:
+    """Phased downpayment breakdown for a BTO purchase."""
+    scheme: str
+    scheme_label: str
+    flat_price: float
+    lease_signing_pct: float
+    lease_signing_downpayment: float
+    lease_signing_stamp_duty: float
+    lease_signing_total: float
+    key_collection_pct: float
+    key_collection_downpayment: float
+    key_collection_legal_fees: float
+    key_collection_loan_shortfall: float
+    key_collection_ehg_offset: float
+    key_collection_total: float
+    actual_loan: float
+    total_upfront: float
 
 
 # =============================================================================
@@ -342,6 +380,52 @@ def calculate_affordability(
     )
 
 
+def calculate_payment_phases(
+    flat_price: float,
+    scheme: str,
+    actual_loan: float,
+    ehg_grant: float = 0,
+) -> PaymentPhaseBreakdown:
+    """
+    Break down the 25% downpayment into lease-signing and key-collection phases.
+
+    Stamp duty is due at lease signing (Agreement for Lease).
+    Legal fees and any loan shortfall are due at key collection.
+    """
+    scheme_info = PAYMENT_SCHEMES[scheme]
+    lease_signing_pct = scheme_info["lease_signing_pct"]
+    key_collection_pct = scheme_info["key_collection_pct"]
+
+    lease_signing_dp = flat_price * lease_signing_pct
+    stamp_duty = calculate_stamp_duty(flat_price)
+    lease_signing_total = lease_signing_dp + stamp_duty
+
+    key_collection_dp = flat_price * key_collection_pct
+    legal_fee_purchase = calculate_hdb_legal_fees(flat_price)
+    legal_fee_mortgage = calculate_hdb_legal_fees(actual_loan)
+    legal_fees = legal_fee_purchase + legal_fee_mortgage
+    loan_shortfall = max(0.0, flat_price * LTV_LIMIT - actual_loan)
+    key_collection_total = key_collection_dp + legal_fees + loan_shortfall - ehg_grant
+
+    return PaymentPhaseBreakdown(
+        scheme=scheme,
+        scheme_label=scheme_info["label"],
+        flat_price=flat_price,
+        lease_signing_pct=lease_signing_pct,
+        lease_signing_downpayment=lease_signing_dp,
+        lease_signing_stamp_duty=stamp_duty,
+        lease_signing_total=lease_signing_total,
+        key_collection_pct=key_collection_pct,
+        key_collection_downpayment=key_collection_dp,
+        key_collection_legal_fees=legal_fees,
+        key_collection_loan_shortfall=loan_shortfall,
+        key_collection_ehg_offset=ehg_grant,
+        key_collection_total=key_collection_total,
+        actual_loan=actual_loan,
+        total_upfront=lease_signing_total + key_collection_total,
+    )
+
+
 def calculate_max_affordable_flat(
     loan_eligibility: LoanEligibility,
     available_downpayment: float
@@ -549,3 +633,107 @@ def format_currency(amount: float) -> str:
         return f"${amount:,.0f}"
     else:
         return f"-${abs(amount):,.0f}"
+
+
+# =============================================================================
+# EHG VS LOAN TIMING ANALYSIS
+# =============================================================================
+
+def calculate_assessed_income(
+    income_1: float,
+    income_2: float,
+    work_start_1: date,
+    work_start_2: date,
+    application_date: date,
+) -> float:
+    """
+    Calculate HDB-assessed combined monthly income.
+
+    HDB uses a 12-month average over the window [application_date - 14m, application_date - 3m].
+    Months where an applicant hadn't started work yet contribute $0.
+    """
+    window_start = application_date - relativedelta(months=14)
+    total = 0.0
+    for i in range(12):
+        month = window_start + relativedelta(months=i)
+        if work_start_1 <= month:
+            total += income_1
+        if work_start_2 <= month:
+            total += income_2
+    return total / 12
+
+
+def calculate_ehg_eligible_date(work_start_1: date, work_start_2: date) -> date:
+    """
+    Return the earliest application date where at least one applicant satisfies
+    the EHG employment requirement: 12 months of work completed at least 2 months
+    before the application date (i.e. work_start + 14 months <= application_date).
+    """
+    return min(work_start_1, work_start_2) + relativedelta(months=14)
+
+
+def generate_timing_series(
+    income_1: float,
+    income_2: float,
+    work_start_1: date,
+    work_start_2: date,
+    target_flat_price: float,
+    start_month: date,
+    num_months: int,
+    credit_card: float = 0,
+    car_loan: float = 0,
+    other_loans: float = 0,
+    dia: bool = False,
+) -> list[TimingAnalysisPoint]:
+    """
+    Generate a TimingAnalysisPoint for each month from start_month to
+    start_month + num_months, showing the EHG grant vs loan trade-off.
+
+    When dia=True, income is assessed 36 months after the application date
+    (Deferred Income Assessment).
+    """
+    ehg_eligible_date = calculate_ehg_eligible_date(work_start_1, work_start_2)
+    loan_needed = target_flat_price * LTV_LIMIT
+    stamp_duty = calculate_stamp_duty(target_flat_price)
+    legal_fee_purchase = calculate_hdb_legal_fees(target_flat_price)
+
+    series = []
+    for i in range(num_months + 1):
+        application_date = start_month + relativedelta(months=i)
+
+        assessment_date = application_date + relativedelta(months=36) if dia else application_date
+        assessed_income = calculate_assessed_income(
+            income_1, income_2, work_start_1, work_start_2, assessment_date
+        )
+
+        ehg_eligible = application_date >= ehg_eligible_date and assessed_income < 9000
+        ehg_amount = get_ehg_amount(assessed_income) if ehg_eligible else 0
+
+        eligibility = calculate_loan_eligibility(
+            gross_income=assessed_income,
+            credit_card_payment=credit_card,
+            car_loan_payment=car_loan,
+            other_loan_payment=other_loans,
+        )
+
+        if eligibility.exceeds_income_ceiling:
+            max_hdb_loan = 0.0
+        else:
+            max_hdb_loan = min(eligibility.max_loan_amount, loan_needed)
+
+        loan_shortfall = max(0.0, loan_needed - max_hdb_loan)
+        legal_fees = legal_fee_purchase + calculate_hdb_legal_fees(max_hdb_loan)
+        cash_needed = target_flat_price - max_hdb_loan - ehg_amount + stamp_duty + legal_fees
+
+        series.append(TimingAnalysisPoint(
+            application_date=application_date,
+            assessed_income=assessed_income,
+            ehg_amount=ehg_amount,
+            max_hdb_loan=max_hdb_loan,
+            loan_needed=loan_needed,
+            loan_shortfall=loan_shortfall,
+            cash_needed=cash_needed,
+            ehg_eligible=ehg_eligible,
+        ))
+
+    return series

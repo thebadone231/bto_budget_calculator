@@ -11,6 +11,7 @@ from plotly.subplots import make_subplots
 
 from calculations import (
     TenureAnalysis,
+    TimingAnalysisPoint,
     calculate_monthly_payment,
     calculate_total_interest,
     project_cpf_oa_balance,
@@ -97,17 +98,21 @@ def create_savings_projection_chart(
                 if work_start <= today:
                     return (target_date.year - today.year) * 12 + target_date.month - today.month
                 elif work_start < target_date:
-                    return (target_date.year - work_start.year) * 12 + target_date.month - work_start.month
+                    first_savings_month = work_start + relativedelta(months=1)
+                    if first_savings_month < target_date:
+                        return (target_date.year - first_savings_month.year) * 12 + target_date.month - first_savings_month.month
+                    else:
+                        return 0
                 else:
                     return 0
-            
+
             working_m_1 = calc_working_months(work_start_1, future_date) if work_start_1 else m
             working_m_2 = calc_working_months(work_start_2, future_date) if work_start_2 else m
-            
+
             cpf_1 = project_cpf_oa_balance(cpf_oa_1, monthly_cpf_1, working_m_1)
             cpf_2 = project_cpf_oa_balance(cpf_oa_2, monthly_cpf_2, working_m_2)
             cpf = cpf_1 + cpf_2
-            
+
             cash_proj_1 = project_cash_balance(cash_1, monthly_cash_1, working_m_1)
             cash_proj_2 = project_cash_balance(cash_2, monthly_cash_2, working_m_2)
             cash = cash_proj_1 + cash_proj_2
@@ -534,22 +539,25 @@ def create_max_affordable_over_time_chart(
             # Calculate per-applicant with work start dates
             future_date = today + relativedelta(months=m)
             
-            # Helper to calculate effective months
             def calc_working_months(work_start, target_date):
                 if work_start <= today:
                     return (target_date.year - today.year) * 12 + target_date.month - today.month
                 elif work_start < target_date:
-                    return (target_date.year - work_start.year) * 12 + target_date.month - work_start.month
+                    first_savings_month = work_start + relativedelta(months=1)
+                    if first_savings_month < target_date:
+                        return (target_date.year - first_savings_month.year) * 12 + target_date.month - first_savings_month.month
+                    else:
+                        return 0
                 else:
                     return 0
-            
+
             working_m_1 = calc_working_months(work_start_1, future_date) if work_start_1 else m
             working_m_2 = calc_working_months(work_start_2, future_date) if work_start_2 else m
-            
+
             cpf_proj_1 = project_cpf_oa_balance(cpf_oa_1, monthly_cpf_1, working_m_1)
             cpf_proj_2 = project_cpf_oa_balance(cpf_oa_2, monthly_cpf_2, working_m_2)
             cpf = cpf_proj_1 + cpf_proj_2
-            
+
             cash_proj_1 = project_cash_balance(cash_1, monthly_cash_1, working_m_1)
             cash_proj_2 = project_cash_balance(cash_2, monthly_cash_2, working_m_2)
             cash = cash_proj_1 + cash_proj_2
@@ -615,6 +623,152 @@ def create_max_affordable_over_time_chart(
 # =============================================================================
 # TENURE COMPARISON TABLE (for display)
 # =============================================================================
+
+# =============================================================================
+# EHG VS LOAN TIMING TRADE-OFF CHART
+# =============================================================================
+
+def create_timing_tradeoff_chart(
+    series: list[TimingAnalysisPoint],
+    ehg_eligible_date,
+    loan_needed: float,
+    optimal_index: int,
+) -> go.Figure:
+    """
+    Dual-axis chart showing the EHG grant vs HDB loan trade-off over time.
+
+    Left Y-axis:  EHG Grant (bars) and Cash Needed (line)
+    Right Y-axis: Max HDB Loan (line) and Loan Needed reference (dashed)
+    """
+    x = list(range(len(series)))
+    x_labels = [p.application_date.strftime("%b %Y") for p in series]
+    ehg_amounts = [p.ehg_amount for p in series]
+    cash_needed = [p.cash_needed for p in series]
+    max_loans = [p.max_hdb_loan for p in series]
+
+    step = max(1, len(series) // 12)
+    tickvals = list(range(0, len(series), step))
+    ticktext = [x_labels[i] for i in tickvals]
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # EHG Grant bars (left axis)
+    fig.add_trace(
+        go.Bar(
+            x=x,
+            y=ehg_amounts,
+            name="EHG Grant",
+            marker_color="rgba(44, 160, 44, 0.55)",
+            hovertemplate="%{customdata}<br>EHG Grant: $%{y:,.0f}<extra></extra>",
+            customdata=x_labels,
+        ),
+        secondary_y=False,
+    )
+
+    # Cash Needed line (left axis)
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=cash_needed,
+            name="Cash Needed",
+            line=dict(color=COLORS["danger"], width=3),
+            hovertemplate="%{customdata}<br>Cash Needed: $%{y:,.0f}<extra></extra>",
+            customdata=x_labels,
+        ),
+        secondary_y=False,
+    )
+
+    # Max HDB Loan line (right axis)
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=max_loans,
+            name="Max HDB Loan",
+            line=dict(color=COLORS["primary"], width=2),
+            hovertemplate="%{customdata}<br>Max HDB Loan: $%{y:,.0f}<extra></extra>",
+            customdata=x_labels,
+        ),
+        secondary_y=True,
+    )
+
+    # Loan Needed reference line (right axis)
+    fig.add_trace(
+        go.Scatter(
+            x=[x[0], x[-1]],
+            y=[loan_needed, loan_needed],
+            name=f"Loan Needed (75%): {format_currency(loan_needed)}",
+            line=dict(color=COLORS["secondary"], width=2, dash="dash"),
+            hovertemplate=f"Loan Needed: {format_currency(loan_needed)}<extra></extra>",
+            showlegend=True,
+        ),
+        secondary_y=True,
+    )
+
+    # Vertical dashed line at EHG eligible month
+    ehg_eligible_indices = [i for i, p in enumerate(series) if p.ehg_eligible]
+    if ehg_eligible_indices:
+        ei = ehg_eligible_indices[0]
+        fig.add_vline(
+            x=ei,
+            line=dict(color=COLORS["success"], width=2, dash="dash"),
+            annotation_text="EHG Eligible",
+            annotation_position="top left",
+        )
+
+    # Star at optimal month (min cash_needed)
+    if 0 <= optimal_index < len(series):
+        fig.add_trace(
+            go.Scatter(
+                x=[optimal_index],
+                y=[cash_needed[optimal_index]],
+                mode="markers+text",
+                name="Optimal Month",
+                marker=dict(size=14, color=COLORS["success"], symbol="star"),
+                text=[f"  Min: {format_currency(cash_needed[optimal_index])}"],
+                textposition="middle right",
+                hovertemplate=(
+                    f"{x_labels[optimal_index]}<br>"
+                    f"Optimal — Cash Needed: ${cash_needed[optimal_index]:,.0f}<extra></extra>"
+                ),
+            ),
+            secondary_y=False,
+        )
+
+    # Shade loan shortfall region
+    shortfall_range = [i for i, p in enumerate(series) if p.loan_shortfall > 0]
+    if shortfall_range:
+        fig.add_vrect(
+            x0=shortfall_range[0] - 0.5,
+            x1=shortfall_range[-1] + 0.5,
+            fillcolor="rgba(214, 39, 40, 0.08)",
+            layer="below",
+            line_width=0,
+            annotation_text="Loan shortfall zone",
+            annotation_position="top right",
+        )
+
+    fig.update_layout(
+        title="EHG Grant vs HDB Loan Trade-off by Application Month",
+        xaxis=dict(tickvals=tickvals, ticktext=ticktext, title="Application Month"),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=500,
+        barmode="overlay",
+    )
+
+    fig.update_yaxes(
+        title_text="EHG Grant & Cash Needed ($)",
+        tickformat="$,.0f",
+        secondary_y=False,
+    )
+    fig.update_yaxes(
+        title_text="Loan Amount ($)",
+        tickformat="$,.0f",
+        secondary_y=True,
+    )
+
+    return fig
+
 
 def create_tenure_table_data(
     loan_amount: float,

@@ -6,6 +6,7 @@ Last updated: February 2026
 """
 
 from datetime import date
+from dateutil.relativedelta import relativedelta
 
 # =============================================================================
 # HDB LOAN PARAMETERS
@@ -19,6 +20,25 @@ MAX_TENURE_YEARS = 25
 
 # Loan-to-Value limit (as of Oct 2024 onwards)
 LTV_LIMIT = 0.75  # 75% - means 25% downpayment required
+
+PAYMENT_SCHEMES = {
+    "standard": {
+        "label": "Standard",
+        "lease_signing_pct": 0.10,
+        "key_collection_pct": 0.15,
+    },
+    "staggered": {
+        "label": "Staggered Downpayment",
+        "lease_signing_pct": 0.05,
+        "key_collection_pct": 0.20,
+    },
+    "dia": {
+        "label": "Deferred Income Assessment (DIA)",
+        "lease_signing_pct": 0.025,
+        "key_collection_pct": 0.225,
+    },
+}
+DEFAULT_PAYMENT_SCHEME = "standard"
 
 # Mortgage Servicing Ratio - max % of gross income for mortgage
 MSR_LIMIT = 0.30  # 30%
@@ -147,6 +167,30 @@ def get_expense_benchmark(gross_income: float) -> dict:
         if benchmark["min_income"] <= gross_income < benchmark["max_income"]:
             return benchmark
     return EXPENSE_BENCHMARKS["high"]
+
+
+# =============================================================================
+# ENHANCED HOUSING GRANT (EHG)
+# Source: HDB official EHG table (couples/families)
+# =============================================================================
+
+EHG_BRACKETS = [
+    (1500, 120000), (2000, 110000), (2500, 105000), (3000, 95000),
+    (3500, 90000),  (4000, 80000),  (4500, 70000),  (5000, 65000),
+    (5500, 55000),  (6000, 50000),  (6500, 40000),  (7000, 30000),
+    (7500, 25000),  (8000, 20000),  (8500, 10000),  (9000, 5000),
+]
+
+EHG_MAX_INCOME = 9000
+
+
+def get_ehg_amount(assessed_income: float) -> int:
+    if assessed_income > EHG_MAX_INCOME:
+        return 0
+    for max_income, grant_amount in EHG_BRACKETS:
+        if assessed_income <= max_income:
+            return grant_amount
+    return 0
 
 
 # =============================================================================
@@ -290,10 +334,10 @@ DEFAULTS = {
     "applicant_1_age": 26,
     "applicant_2_age": 24,
     "applicant_1_income": 5300,
-    "applicant_2_income": 5300,
-    # Work start dates (None = currently working, or date(year, month, day) for specific start date)
-    "applicant_1_work_start_date": None,  # Currently working
-    "applicant_2_work_start_date": date(2026, 5, 1),  # Starts May 1, 2026
+    "applicant_2_income": 4500,
+    # Work start dates (past = already working, future = not started yet)
+    "applicant_1_work_start_date": date(2025,7,7),
+    "applicant_2_work_start_date": date(2026,5,1),
     # Per-applicant financial commitments
     "applicant_1_credit_card": 0,
     "applicant_1_car_loan": 0,
@@ -302,14 +346,15 @@ DEFAULTS = {
     "applicant_2_car_loan": 0,
     "applicant_2_other_loans": 0,
     # Per-applicant savings
-    "applicant_1_cpf_oa": 10800,
-    "applicant_1_cash": 12600,
+    "applicant_1_cpf_oa": 15500,
+    "applicant_1_cash": 19500,
     "applicant_1_monthly_cash_savings": 1800,
     "applicant_2_cpf_oa": 0,
     "applicant_2_cash": 0,
     "applicant_2_monthly_cash_savings": 1800,
     # Target flat
-    "target_flat_price": 800000,
+    "target_flat_price": 600000,
+    "payment_scheme": "standard",
 }
 
 # Flat price range for slider

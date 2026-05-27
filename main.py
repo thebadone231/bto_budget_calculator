@@ -31,6 +31,10 @@ from constants import (
     LTV_LIMIT,
     MSR_LIMIT,
     HDB_INCOME_CEILING,
+    EHG_BRACKETS,
+    EHG_MAX_INCOME,
+    PAYMENT_SCHEMES,
+    DEFAULT_PAYMENT_SCHEME,
     get_cpf_rates,
     calculate_stamp_duty,
     calculate_hdb_legal_fees,
@@ -54,6 +58,9 @@ from calculations import (
     check_savings_health,
     months_between_dates,
     format_currency,
+    calculate_ehg_eligible_date,
+    generate_timing_series,
+    calculate_payment_phases,
 )
 
 from charts import (
@@ -63,6 +70,7 @@ from charts import (
     create_msr_allocation_chart,
     create_max_affordable_over_time_chart,
     create_tenure_table_data,
+    create_timing_tradeoff_chart,
 )
 
 
@@ -95,13 +103,14 @@ def calculate_effective_working_months(
     - Returns 0 if they start after completion
     """
     if work_start_date <= today:
-        # Already working, count all months until completion
         return months_between_dates(today, completion_date)
     elif work_start_date < completion_date:
-        # Will start working before completion
-        return months_between_dates(work_start_date, completion_date)
+        first_savings_date = work_start_date + relativedelta(months=1)
+        if first_savings_date < completion_date:
+            return months_between_dates(first_savings_date, completion_date)
+        else:
+            return 0
     else:
-        # Won't start working before completion
         return 0
 
 
@@ -159,29 +168,29 @@ def render_sidebar():
     
     # Work start dates
     today = date.today()
-    
-    # Calculate default dates from DEFAULTS
-    # If None, use today (currently working). If date object, use that date.
-    default_work_start_1 = DEFAULTS["applicant_1_work_start_date"] if DEFAULTS["applicant_1_work_start_date"] is not None else today
-    default_work_start_2 = DEFAULTS["applicant_2_work_start_date"] if DEFAULTS["applicant_2_work_start_date"] is not None else today
-    
+
     col1, col2 = st.sidebar.columns(2)
     with col1:
         work_start_1 = st.date_input(
             "Applicant 1 Work Start",
-            value=default_work_start_1,
+            value=DEFAULTS["applicant_1_work_start_date"],
             min_value=today - relativedelta(years=10),
             max_value=today + relativedelta(years=5),
-            help="Date when applicant 1 starts/started working. Defaults to now (currently working).",
+            key="work_start_date_1",
+            help="Past date = already working; future date = not started yet",
         )
     with col2:
         work_start_2 = st.date_input(
             "Applicant 2 Work Start",
-            value=default_work_start_2,
+            value=DEFAULTS["applicant_2_work_start_date"],
             min_value=today - relativedelta(years=10),
             max_value=today + relativedelta(years=5),
-            help="Date when applicant 2 starts/started working. Defaults to now (currently working).",
+            key="work_start_date_2",
+            help="Past date = already working; future date = not started yet",
         )
+
+    currently_working_1 = work_start_1 <= today
+    currently_working_2 = work_start_2 <= today
     
     combined_income = income_1 + income_2
     st.sidebar.info(f"**Combined Gross Income:** {format_currency(combined_income)}")
@@ -299,10 +308,9 @@ def render_sidebar():
         monthly_cpf_1 = calculate_monthly_cpf_oa(income_1, age_1)
         st.caption(f"**Monthly CPF OA:** {format_currency(monthly_cpf_1)}")
         
-        # Show work status
-        if work_start_1 > today:
+        if not currently_working_1:
             months_until = months_between_dates(today, work_start_1)
-            st.caption(f"⏳ Starting work in {months_until} months")
+            st.caption(f"⏳ Starts work in {months_until} months (savings begin 1 month later)")
     
     # Applicant 2 Savings
     with st.sidebar.expander("👤 Applicant 2 Savings", expanded=True):
@@ -334,10 +342,9 @@ def render_sidebar():
         monthly_cpf_2 = calculate_monthly_cpf_oa(income_2, age_2)
         st.caption(f"**Monthly CPF OA:** {format_currency(monthly_cpf_2)}")
         
-        # Show work status
-        if work_start_2 > today:
+        if not currently_working_2:
             months_until = months_between_dates(today, work_start_2)
-            st.caption(f"⏳ Starting work in {months_until} months")
+            st.caption(f"⏳ Starts work in {months_until} months (savings begin 1 month later)")
     
     # Combined totals
     current_cpf = cpf_oa_1 + cpf_oa_2
@@ -427,7 +434,15 @@ def render_sidebar():
     
     months_to_completion = months_between_dates(today, completion_date)
     st.sidebar.info(f"**{months_to_completion} months** from now")
-    
+
+    payment_scheme = st.sidebar.radio(
+        "Payment Scheme",
+        options=list(PAYMENT_SCHEMES.keys()),
+        format_func=lambda x: PAYMENT_SCHEMES[x]["label"],
+        index=list(PAYMENT_SCHEMES.keys()).index(DEFAULT_PAYMENT_SCHEME),
+        help="BTO downpayment scheme selected at signing",
+    )
+
     # Return all config values
     return {
         "age_1": age_1,
@@ -438,6 +453,8 @@ def render_sidebar():
         "combined_income": combined_income,
         "work_start_1": work_start_1,
         "work_start_2": work_start_2,
+        "currently_working_1": currently_working_1,
+        "currently_working_2": currently_working_2,
         # Per-applicant commitments
         "credit_card_1": credit_card_1,
         "car_loan_1": car_loan_1,
@@ -469,6 +486,7 @@ def render_sidebar():
         "target_price": target_price,
         "completion_date": completion_date,
         "months_to_completion": months_to_completion,
+        "payment_scheme": payment_scheme,
     }
 
 
@@ -537,7 +555,7 @@ def render_loan_eligibility_tab(config: dict):
             gross_income=config["combined_income"],
             existing_commitments=eligibility.total_commitments,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     
     # Warnings
     if eligibility.exceeds_income_ceiling:
@@ -551,7 +569,17 @@ def render_loan_eligibility_tab(config: dict):
             "⚠️ Your existing financial commitments are consuming more than 50% of your MSR. "
             "Consider paying off some debts to increase your loan eligibility."
         )
-    
+
+    target_loan = calculate_loan_amount(config["target_price"])
+    if target_loan > eligibility.max_loan_amount:
+        shortfall = target_loan - eligibility.max_loan_amount
+        st.info(
+            f"ℹ️ **Loan Shortfall:** Your maximum loan eligibility ({format_currency(eligibility.max_loan_amount)}) "
+            f"is less than the 75% LTV loan required for your target flat "
+            f"({format_currency(target_loan)}). The shortfall of **{format_currency(shortfall)}** "
+            "must be covered with additional cash or CPF OA at key collection."
+        )
+
     return eligibility
 
 
@@ -603,32 +631,42 @@ def render_completion_tab(config: dict, eligibility):
         projected_cpf_oa=projected_cpf,
         projected_cash=projected_cash,
     )
-    
+
+    actual_loan = min(calculate_loan_amount(config["target_price"]), eligibility.max_loan_amount)
+    phases = calculate_payment_phases(config["target_price"], config["payment_scheme"], actual_loan)
+
     # Summary metrics
-    col1, col2, col3, col4 = st.columns(4)
-    
+    col1, col2, col3, col4, col5 = st.columns(5)
+
     with col1:
         st.metric(
             "Target Flat Price",
             format_currency(config["target_price"]),
         )
-    
+
     with col2:
         st.metric(
-            "Total Upfront Required",
-            format_currency(affordability.required_downpayment),
-            help="25% downpayment + stamp duty + legal fees"
+            "At Lease Signing",
+            format_currency(phases.lease_signing_total),
+            help=f"{phases.lease_signing_pct:.1%} downpayment + stamp duty",
         )
-    
+
     with col3:
+        st.metric(
+            "At Key Collection",
+            format_currency(phases.key_collection_total),
+            help=f"{phases.key_collection_pct:.1%} downpayment + legal fees + shortfall",
+        )
+
+    with col4:
         st.metric(
             "Projected Total Savings",
             format_currency(affordability.total_available),
             delta=format_currency(affordability.total_available - config["current_cpf"] - config["current_cash"]),
             help="CPF OA + Cash at completion date",
         )
-    
-    with col4:
+
+    with col5:
         if affordability.can_afford:
             st.metric(
                 "Status",
@@ -658,8 +696,8 @@ def render_completion_tab(config: dict, eligibility):
         if working_months_1 > 0:
             st.write(f"- + {working_months_1} months × {format_currency(config['monthly_cpf_1'])}/month")
             st.write(f"- + CPF interest (~2.5% p.a.)")
-        elif config["work_start_1"] > today:
-            st.write(f"- ⏳ Not working yet (starts in {months_between_dates(today, config['work_start_1'])} months)")
+        elif not config.get("currently_working_1", True):
+            st.write(f"- ⏳ Not working yet (starts in {months_between_dates(today, config['work_start_1'])} months, savings begin 1 month later)")
         st.write(f"- Projected CPF OA: {format_currency(projected_cpf_1)}")
         
         st.write(f"- Current Cash: {format_currency(config['cash_1'])}")
@@ -675,8 +713,8 @@ def render_completion_tab(config: dict, eligibility):
         if working_months_2 > 0:
             st.write(f"- + {working_months_2} months × {format_currency(config['monthly_cpf_2'])}/month")
             st.write(f"- + CPF interest (~2.5% p.a.)")
-        elif config["work_start_2"] > today:
-            st.write(f"- ⏳ Not working yet (starts in {months_between_dates(today, config['work_start_2'])} months)")
+        elif not config.get("currently_working_2", True):
+            st.write(f"- ⏳ Not working yet (starts in {months_between_dates(today, config['work_start_2'])} months, savings begin 1 month later)")
         st.write(f"- Projected CPF OA: {format_currency(projected_cpf_2)}")
         
         st.write(f"- Current Cash: {format_currency(config['cash_2'])}")
@@ -689,23 +727,35 @@ def render_completion_tab(config: dict, eligibility):
     
     with col2:
         st.subheader("🏠 What You Need")
-        st.write(f"**Flat Price Breakdown:**")
-        st.write(f"- Flat Price: {format_currency(config['target_price'])}")
-        st.write(f"- + Stamp Duty (BSD): {format_currency(affordability.stamp_duty)}")
-        st.write(f"- + Legal Fees: {format_currency(affordability.legal_fees)}")
-        st.write(f"- **Total Cost:** {format_currency(affordability.total_cost)}")
+        st.caption(f"Scheme: {phases.scheme_label}")
+
+        st.write(f"**Phase 1 — Lease Signing ({phases.lease_signing_pct:.1%}):**")
+        st.write(f"- Downpayment ({phases.lease_signing_pct:.1%}): {format_currency(phases.lease_signing_downpayment)}")
+        st.write(f"- + Stamp Duty (BSD): {format_currency(phases.lease_signing_stamp_duty)}")
+        st.write(f"- **= At Lease Signing: {format_currency(phases.lease_signing_total)}**")
+
         st.markdown("---")
-        st.write(f"**Financing:**")
-        downpayment_on_flat = affordability.required_downpayment - affordability.stamp_duty - affordability.legal_fees
-        st.write(f"- Downpayment (25%): {format_currency(downpayment_on_flat)}")
-        st.write(f"- + Stamp Duty: {format_currency(affordability.stamp_duty)}")
-        st.write(f"- + Legal Fees: {format_currency(affordability.legal_fees)}")
-        st.write(f"- **= Upfront Required:** {format_currency(affordability.required_downpayment)}")
-        st.write(f"- Loan Amount (75%): {format_currency(affordability.loan_amount)}")
+
+        st.write(f"**Phase 2 — Key Collection ({phases.key_collection_pct:.1%}):**")
+        st.write(f"- Downpayment ({phases.key_collection_pct:.1%}): {format_currency(phases.key_collection_downpayment)}")
+        st.write(f"- + Legal Fees: {format_currency(phases.key_collection_legal_fees)}")
+        if phases.key_collection_loan_shortfall > 0:
+            st.write(f"- + Loan Shortfall: {format_currency(phases.key_collection_loan_shortfall)}")
+        st.write(f"- **= At Key Collection: {format_currency(phases.key_collection_total)}**")
+
         st.markdown("---")
-        st.write(f"- Your Max Loan Eligibility: {format_currency(eligibility.max_loan_amount)}")
+
+        st.write(f"**Loan Amount:** {format_currency(phases.actual_loan)}")
+        st.write(f"- Max Loan Eligibility: {format_currency(eligibility.max_loan_amount)}")
         loan_status = "✅ Within limit" if affordability.can_afford_loan else "❌ Exceeds limit"
         st.write(f"- Loan Status: {loan_status}")
+
+        if phases.key_collection_loan_shortfall > 0:
+            st.warning(
+                f"⚠️ **Loan Shortfall: {format_currency(phases.key_collection_loan_shortfall)}**\n\n"
+                "Shortfall = Purchase Price − Downpayment Paid − Actual Loan − Grants"
+            )
+
         st.markdown("---")
         if affordability.can_afford:
             st.success(f"**You have a surplus of {format_currency(-affordability.downpayment_gap)}**")
@@ -724,7 +774,7 @@ def render_completion_tab(config: dict, eligibility):
         stamp_duty=affordability.stamp_duty,
         legal_fees=affordability.legal_fees,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     
     # If not affordable, show what's needed
     if not affordability.can_afford:
@@ -795,7 +845,19 @@ def render_planner_tab(config: dict, eligibility):
             work_start_1=config["work_start_1"],
             work_start_2=config["work_start_2"],
         )
-        st.plotly_chart(fig, use_container_width=True)
+        scheme_info = PAYMENT_SCHEMES[config["payment_scheme"]]
+        lease_signing_amount = (
+            config["target_price"] * scheme_info["lease_signing_pct"]
+            + calculate_stamp_duty(config["target_price"])
+        )
+        fig.add_hline(
+            y=lease_signing_amount,
+            line_dash="dot",
+            line_color="orange",
+            annotation_text=f"Lease Signing ({scheme_info['label']}): {format_currency(lease_signing_amount)}",
+            annotation_position="right",
+        )
+        st.plotly_chart(fig, width='stretch')
     
     st.markdown("---")
     
@@ -824,7 +886,7 @@ def render_planner_tab(config: dict, eligibility):
         work_start_1=config["work_start_1"],
         work_start_2=config["work_start_2"],
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width='stretch')
     
     # Find when target flat becomes affordable
     today = date.today()
@@ -1115,7 +1177,7 @@ def render_tenure_optimizer_tab(config: dict, eligibility):
         max_monthly_payment=eligibility.max_monthly_installment,
         interest_rate=HDB_INTEREST_RATE,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     
     # Tenure comparison table
     st.subheader("📋 Tenure Comparison")
@@ -1127,7 +1189,7 @@ def render_tenure_optimizer_tab(config: dict, eligibility):
     )
     
     df = pd.DataFrame(table_data)
-    st.dataframe(df, hide_index=True, use_container_width=True)
+    st.dataframe(df, hide_index=True, width='stretch')
     
     # Find optimal tenure
     st.markdown("---")
@@ -1164,6 +1226,157 @@ def render_tenure_optimizer_tab(config: dict, eligibility):
 
 
 # =============================================================================
+# TAB 6: EHG VS LOAN TIMING
+# =============================================================================
+
+def render_timing_tab(config: dict):
+    """Tab 6: EHG vs HDB Loan application timing trade-off."""
+    st.header("📆 EHG vs Loan Application Timing")
+    st.caption(
+        "Find the optimal month to apply — earlier means more EHG (credited to CPF OA) "
+        "but a smaller HDB loan; later means a larger loan but less or no EHG. "
+        "The chart minimises the cash you need to prepare upfront."
+    )
+
+    is_dia = config["payment_scheme"] == "dia"
+
+    horizon_min = 36 if is_dia else 12
+    if "timing_horizon" in st.session_state and st.session_state.timing_horizon < horizon_min:
+        st.session_state.timing_horizon = horizon_min
+    horizon_default = max(horizon_min, st.session_state.get("timing_horizon", horizon_min))
+    planning_horizon = st.slider(
+        "Planning Horizon (months)",
+        min_value=horizon_min,
+        max_value=60,
+        value=horizon_default,
+        step=6,
+        key="timing_horizon",
+    )
+
+    if is_dia:
+        st.info(
+            "**DIA selected:** Income will only be assessed during key collection (assume 3 years from application date). "
+            "Planning horizon starts at 36 months. "
+            "Income is assumed to remain unchanged during the deferral period."
+        )
+
+    today = date.today()
+
+    series = generate_timing_series(
+        income_1=config["income_1"],
+        income_2=config["income_2"],
+        work_start_1=config["work_start_1"],
+        work_start_2=config["work_start_2"],
+        target_flat_price=config["target_price"],
+        start_month=today,
+        num_months=planning_horizon,
+        credit_card=config["credit_card"],
+        car_loan=config["car_loan"],
+        other_loans=config["other_loans"],
+        dia=is_dia,
+    )
+
+    optimal_index = min(range(len(series)), key=lambda i: series[i].cash_needed)
+    ehg_eligible_date = calculate_ehg_eligible_date(config["work_start_1"], config["work_start_2"])
+    loan_needed = config["target_price"] * LTV_LIMIT
+
+    # Notify if EHG never appears in the series
+    if not any(p.ehg_amount > 0 for p in series):
+        eligible_points = [p for p in series if p.ehg_eligible]
+        if eligible_points:
+            st.info(
+                f"Once EHG eligibility is reached, combined assessed income "
+                f"({format_currency(eligible_points[0].assessed_income)}/month) exceeds the "
+                f"${EHG_MAX_INCOME:,}/month EHG ceiling — no EHG grant available. "
+                "Chart shows loan eligibility growth only."
+            )
+        else:
+            st.info(
+                f"EHG eligibility starts {ehg_eligible_date.strftime('%b %Y')} "
+                f"({(ehg_eligible_date.year - today.year) * 12 + ehg_eligible_date.month - today.month} months away). "
+                "Extend the planning horizon or scroll to that period to see EHG options."
+            )
+
+    fig = create_timing_tradeoff_chart(
+        series=series,
+        ehg_eligible_date=ehg_eligible_date,
+        loan_needed=loan_needed,
+        optimal_index=optimal_index,
+    )
+    st.plotly_chart(fig, width='stretch')
+
+    # Summary metrics
+    optimal = series[optimal_index]
+    timing_scheme_info = PAYMENT_SCHEMES[config["payment_scheme"]]
+    timing_stamp_duty = calculate_stamp_duty(config["target_price"])
+    timing_legal_fee_purchase = calculate_hdb_legal_fees(config["target_price"])
+    optimal_legal_fees = timing_legal_fee_purchase + calculate_hdb_legal_fees(optimal.max_hdb_loan)
+    optimal_lease_signing = config["target_price"] * timing_scheme_info["lease_signing_pct"] + timing_stamp_duty
+    optimal_key_collection = (
+        config["target_price"] * timing_scheme_info["key_collection_pct"]
+        + optimal_legal_fees
+        + optimal.loan_shortfall
+        - optimal.ehg_amount
+    )
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("Optimal Application Month", optimal.application_date.strftime("%b %Y"))
+    with col2:
+        st.metric("EHG Grant at Optimal", format_currency(optimal.ehg_amount))
+    with col3:
+        st.metric("At Lease Signing", format_currency(optimal_lease_signing))
+    with col4:
+        st.metric("At Key Collection", format_currency(optimal_key_collection))
+    with col5:
+        st.metric("Assessed Income", format_currency(optimal.assessed_income))
+
+    st.markdown("---")
+
+    # Comparison table for key months
+    st.subheader("📋 Key Month Comparison")
+    key_indices = list(range(len(series)))
+
+    table_data = []
+    for i in key_indices:
+        p = series[i]
+        row_legal_fees = timing_legal_fee_purchase + calculate_hdb_legal_fees(p.max_hdb_loan)
+        at_lease_signing = config["target_price"] * timing_scheme_info["lease_signing_pct"] + timing_stamp_duty
+        at_key_collection = (
+            config["target_price"] * timing_scheme_info["key_collection_pct"]
+            + row_legal_fees
+            + p.loan_shortfall
+            - p.ehg_amount
+        )
+        table_data.append({
+            "Month": p.application_date.strftime("%b %Y"),
+            "Assessed Income": format_currency(p.assessed_income),
+            "EHG Grant": format_currency(p.ehg_amount),
+            "Max HDB Loan": format_currency(p.max_hdb_loan),
+            "Loan Shortfall": format_currency(p.loan_shortfall) if p.loan_shortfall > 0 else "—",
+            "At Lease Signing": format_currency(at_lease_signing),
+            "At Key Collection": format_currency(at_key_collection),
+            "CPF/Cash Needed": format_currency(p.cash_needed),
+            "EHG Eligible": "✅" if p.ehg_eligible else "❌",
+            "": "⭐" if i == optimal_index else "",
+        })
+
+    st.dataframe(pd.DataFrame(table_data), hide_index=True, width='stretch')
+
+    # EHG bracket reference
+    with st.expander("📊 EHG Grant Bracket Reference"):
+        ehg_table = [
+            {"Assessed Monthly Income": f"≤ ${max_income:,}", "EHG Grant": format_currency(grant)}
+            for max_income, grant in EHG_BRACKETS
+        ]
+        st.dataframe(pd.DataFrame(ehg_table), hide_index=True)
+        st.caption(
+            f"EHG available only when combined assessed monthly income ≤ ${EHG_MAX_INCOME:,}. "
+            "Grant is credited to CPF OA and directly offsets your downpayment cash requirement."
+        )
+
+
+# =============================================================================
 # MAIN APP
 # =============================================================================
 
@@ -1194,22 +1407,26 @@ def main():
         "📈 Interactive Planner",
         "🔮 What-If Analysis",
         "⚖️ Tenure Optimizer",
+        "📆 EHG vs Loan Timing",
     ])
-    
+
     with tabs[0]:
         eligibility = render_loan_eligibility_tab(config)
-    
+
     with tabs[1]:
         render_completion_tab(config, eligibility)
-    
+
     with tabs[2]:
         render_planner_tab(config, eligibility)
-    
+
     with tabs[3]:
         render_whatif_tab(config)
-    
+
     with tabs[4]:
         render_tenure_optimizer_tab(config, eligibility)
+
+    with tabs[5]:
+        render_timing_tab(config)
     
     # Footer
     st.markdown("---")
