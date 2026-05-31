@@ -94,6 +94,17 @@ class TimingAnalysisPoint:
 
 
 @dataclass
+class LeaseSigningAllocation:
+    """Per-applicant CPF/cash split at lease signing."""
+    cpf_contrib_1: float
+    cash_contrib_1: float
+    cpf_contrib_2: float
+    cash_contrib_2: float
+    shortfall: float
+    months_to_close_shortfall: float
+
+
+@dataclass
 class PaymentPhaseBreakdown:
     """Phased downpayment breakdown for a BTO purchase."""
     scheme: str
@@ -102,10 +113,10 @@ class PaymentPhaseBreakdown:
     lease_signing_pct: float
     lease_signing_downpayment: float
     lease_signing_stamp_duty: float
+    lease_signing_legal_fees: float
     lease_signing_total: float
     key_collection_pct: float
     key_collection_downpayment: float
-    key_collection_legal_fees: float
     key_collection_loan_shortfall: float
     key_collection_ehg_offset: float
     key_collection_total: float
@@ -389,8 +400,8 @@ def calculate_payment_phases(
     """
     Break down the 25% downpayment into lease-signing and key-collection phases.
 
-    Stamp duty is due at lease signing (Agreement for Lease).
-    Legal fees and any loan shortfall are due at key collection.
+    Stamp duty and legal fees are due at lease signing (Agreement for Lease).
+    Any loan shortfall is due at key collection.
     """
     scheme_info = PAYMENT_SCHEMES[scheme]
     lease_signing_pct = scheme_info["lease_signing_pct"]
@@ -398,14 +409,14 @@ def calculate_payment_phases(
 
     lease_signing_dp = flat_price * lease_signing_pct
     stamp_duty = calculate_stamp_duty(flat_price)
-    lease_signing_total = lease_signing_dp + stamp_duty
-
-    key_collection_dp = flat_price * key_collection_pct
     legal_fee_purchase = calculate_hdb_legal_fees(flat_price)
     legal_fee_mortgage = calculate_hdb_legal_fees(actual_loan)
     legal_fees = legal_fee_purchase + legal_fee_mortgage
+    lease_signing_total = lease_signing_dp + stamp_duty + legal_fees
+
+    key_collection_dp = flat_price * key_collection_pct
     loan_shortfall = max(0.0, flat_price * LTV_LIMIT - actual_loan)
-    key_collection_total = key_collection_dp + legal_fees + loan_shortfall - ehg_grant
+    key_collection_total = key_collection_dp + loan_shortfall - ehg_grant
 
     return PaymentPhaseBreakdown(
         scheme=scheme,
@@ -414,10 +425,10 @@ def calculate_payment_phases(
         lease_signing_pct=lease_signing_pct,
         lease_signing_downpayment=lease_signing_dp,
         lease_signing_stamp_duty=stamp_duty,
+        lease_signing_legal_fees=legal_fees,
         lease_signing_total=lease_signing_total,
         key_collection_pct=key_collection_pct,
         key_collection_downpayment=key_collection_dp,
-        key_collection_legal_fees=legal_fees,
         key_collection_loan_shortfall=loan_shortfall,
         key_collection_ehg_offset=ehg_grant,
         key_collection_total=key_collection_total,
@@ -737,3 +748,76 @@ def generate_timing_series(
         ))
 
     return series
+
+
+def allocate_lease_signing_payment(
+    amount_needed: float,
+    cpf_1: float,
+    cpf_2: float,
+    cash_1: float,
+    cash_2: float,
+    monthly_combined_savings: float,
+) -> LeaseSigningAllocation:
+    """
+    Split the lease-signing amount between two applicants using a CPF-first,
+    equal-split-with-spillover algorithm.
+
+    Step 1: CPF equal split, each covers up to half.
+    Step 2: CPF spillover — if one is short, the other's surplus CPF covers the gap.
+    Step 3: Cash equal split of whatever remains.
+    Step 4: Cash spillover — same pattern.
+    Step 5: Compute shortfall and months-to-close.
+    """
+    import math
+
+    remaining = amount_needed
+
+    # Step 1 & 2: CPF
+    target_each = remaining / 2
+    cpf_c1 = min(cpf_1, target_each)
+    cpf_c2 = min(cpf_2, target_each)
+    remaining -= cpf_c1 + cpf_c2
+
+    # CPF spillover
+    if remaining > 0:
+        extra = min(cpf_1 - cpf_c1, remaining)
+        cpf_c1 += extra
+        remaining -= extra
+    if remaining > 0:
+        extra = min(cpf_2 - cpf_c2, remaining)
+        cpf_c2 += extra
+        remaining -= extra
+
+    # Step 3 & 4: Cash
+    cash_c1 = cash_c2 = 0.0
+    if remaining > 0:
+        target_each = remaining / 2
+        cash_c1 = min(cash_1, target_each)
+        cash_c2 = min(cash_2, target_each)
+        remaining -= cash_c1 + cash_c2
+
+    # Cash spillover
+    if remaining > 0:
+        extra = min(cash_1 - cash_c1, remaining)
+        cash_c1 += extra
+        remaining -= extra
+    if remaining > 0:
+        extra = min(cash_2 - cash_c2, remaining)
+        cash_c2 += extra
+        remaining -= extra
+
+    shortfall = max(0.0, remaining)
+    months_to_close = (
+        math.ceil(shortfall / monthly_combined_savings)
+        if shortfall > 0 and monthly_combined_savings > 0
+        else 0.0
+    )
+
+    return LeaseSigningAllocation(
+        cpf_contrib_1=cpf_c1,
+        cash_contrib_1=cash_c1,
+        cpf_contrib_2=cpf_c2,
+        cash_contrib_2=cash_c2,
+        shortfall=shortfall,
+        months_to_close_shortfall=months_to_close,
+    )

@@ -330,6 +330,17 @@ def calculate_total_upfront_cost(flat_price: float, loan_amount: float) -> tuple
 # DEFAULT VALUES FOR UI
 # =============================================================================
 
+# =============================================================================
+# HDB BTO LAUNCHES
+# =============================================================================
+
+HDB_BTO_LAUNCHES = [
+    ("Jun 2026", date(2026, 6, 1)),
+    ("Oct 2026", date(2026, 10, 1)),
+]
+LEASE_SIGNING_OFFSET_MONTHS = 6
+
+
 DEFAULTS = {
     "applicant_1_age": 26,
     "applicant_2_age": 24,
@@ -347,15 +358,17 @@ DEFAULTS = {
     "applicant_2_other_loans": 0,
     # Per-applicant savings
     "applicant_1_cpf_oa": 15500,
-    "applicant_1_cash": 19500,
-    "applicant_1_monthly_cash_savings": 1800,
+    "applicant_1_cash": 19800,
+    "applicant_1_monthly_cash_savings": 1300,
     "applicant_2_cpf_oa": 0,
     "applicant_2_cash": 0,
-    "applicant_2_monthly_cash_savings": 1800,
+    "applicant_2_monthly_cash_savings": 1300,
     # Target flat
-    "target_flat_price": 600000,
+    "target_flat_price": 550000,
     "payment_scheme": "standard",
 }
+
+DEFAULT_COMPLETION_DATE = date(2029, 12, 31)
 
 # Flat price range for slider
 FLAT_PRICE_MIN = 200000

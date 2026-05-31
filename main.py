@@ -35,6 +35,9 @@ from constants import (
     EHG_MAX_INCOME,
     PAYMENT_SCHEMES,
     DEFAULT_PAYMENT_SCHEME,
+    HDB_BTO_LAUNCHES,
+    LEASE_SIGNING_OFFSET_MONTHS,
+    DEFAULT_COMPLETION_DATE,
     get_cpf_rates,
     calculate_stamp_duty,
     calculate_hdb_legal_fees,
@@ -61,6 +64,7 @@ from calculations import (
     calculate_ehg_eligible_date,
     generate_timing_series,
     calculate_payment_phases,
+    allocate_lease_signing_payment,
 )
 
 from charts import (
@@ -422,11 +426,9 @@ def render_sidebar():
     today = date.today()
     min_date = today + relativedelta(months=6)
     max_date = today + relativedelta(years=6)
-    default_date = date(2028, 12, 31)  # Fixed default: 31 Dec 2028
-    
     completion_date = st.sidebar.date_input(
         "Expected Completion Date",
-        value=default_date,
+        value=DEFAULT_COMPLETION_DATE,
         min_value=min_date,
         max_value=max_date,
         help="When do you expect the flat to be completed?",
@@ -442,6 +444,18 @@ def render_sidebar():
         index=list(PAYMENT_SCHEMES.keys()).index(DEFAULT_PAYMENT_SCHEME),
         help="BTO downpayment scheme selected at signing",
     )
+
+    launch_labels = [label for label, _ in HDB_BTO_LAUNCHES]
+    launch_dates = [d for _, d in HDB_BTO_LAUNCHES]
+    selected_launch_idx = st.sidebar.selectbox(
+        "Target BTO Launch",
+        options=range(len(HDB_BTO_LAUNCHES)),
+        format_func=lambda i: launch_labels[i],
+        help="Which HDB BTO launch are you targeting?",
+    )
+    bto_application_date = launch_dates[selected_launch_idx]
+    lease_signing_date = bto_application_date + relativedelta(months=LEASE_SIGNING_OFFSET_MONTHS)
+    st.sidebar.caption(f"Lease signing: ~{lease_signing_date.strftime('%b %Y')} ({LEASE_SIGNING_OFFSET_MONTHS} months after launch)")
 
     # Return all config values
     return {
@@ -487,6 +501,8 @@ def render_sidebar():
         "completion_date": completion_date,
         "months_to_completion": months_to_completion,
         "payment_scheme": payment_scheme,
+        "bto_application_date": bto_application_date,
+        "lease_signing_date": lease_signing_date,
     }
 
 
@@ -662,7 +678,6 @@ def render_completion_tab(config: dict, eligibility):
         st.metric(
             "Projected Total Savings",
             format_currency(affordability.total_available),
-            delta=format_currency(affordability.total_available - config["current_cpf"] - config["current_cash"]),
             help="CPF OA + Cash at completion date",
         )
 
@@ -683,84 +698,287 @@ def render_completion_tab(config: dict, eligibility):
             )
     
     st.markdown("---")
-    
-    # Detailed breakdown
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("💰 Your Resources at Completion")
-        
-        # Applicant 1 breakdown
-        st.write(f"**Applicant 1:**")
-        st.write(f"- Current CPF OA: {format_currency(config['cpf_oa_1'])}")
-        if working_months_1 > 0:
-            st.write(f"- + {working_months_1} months × {format_currency(config['monthly_cpf_1'])}/month")
-            st.write(f"- + CPF interest (~2.5% p.a.)")
-        elif not config.get("currently_working_1", True):
-            st.write(f"- ⏳ Not working yet (starts in {months_between_dates(today, config['work_start_1'])} months, savings begin 1 month later)")
-        st.write(f"- Projected CPF OA: {format_currency(projected_cpf_1)}")
-        
-        st.write(f"- Current Cash: {format_currency(config['cash_1'])}")
-        if working_months_1 > 0:
-            st.write(f"- + {working_months_1} months × {format_currency(config['monthly_cash_1'])}/month")
-        st.write(f"- Projected Cash: {format_currency(projected_cash_1)}")
-        
-        st.markdown("---")
-        
-        # Applicant 2 breakdown
-        st.write(f"**Applicant 2:**")
-        st.write(f"- Current CPF OA: {format_currency(config['cpf_oa_2'])}")
-        if working_months_2 > 0:
-            st.write(f"- + {working_months_2} months × {format_currency(config['monthly_cpf_2'])}/month")
-            st.write(f"- + CPF interest (~2.5% p.a.)")
-        elif not config.get("currently_working_2", True):
-            st.write(f"- ⏳ Not working yet (starts in {months_between_dates(today, config['work_start_2'])} months, savings begin 1 month later)")
-        st.write(f"- Projected CPF OA: {format_currency(projected_cpf_2)}")
-        
-        st.write(f"- Current Cash: {format_currency(config['cash_2'])}")
-        if working_months_2 > 0:
-            st.write(f"- + {working_months_2} months × {format_currency(config['monthly_cash_2'])}/month")
-        st.write(f"- Projected Cash: {format_currency(projected_cash_2)}")
-        
-        st.markdown("---")
-        st.write(f"**Combined Total Available:** {format_currency(affordability.total_available)}")
-    
-    with col2:
-        st.subheader("🏠 What You Need")
-        st.caption(f"Scheme: {phases.scheme_label}")
 
-        st.write(f"**Phase 1 — Lease Signing ({phases.lease_signing_pct:.1%}):**")
-        st.write(f"- Downpayment ({phases.lease_signing_pct:.1%}): {format_currency(phases.lease_signing_downpayment)}")
-        st.write(f"- + Stamp Duty (BSD): {format_currency(phases.lease_signing_stamp_duty)}")
-        st.write(f"- **= At Lease Signing: {format_currency(phases.lease_signing_total)}**")
+    # Lease signing projections — computed once, used by both columns
+    lease_signing_date = config["lease_signing_date"]
+    ls_wm_1 = calculate_effective_working_months(config["work_start_1"], lease_signing_date, today)
+    ls_wm_2 = calculate_effective_working_months(config["work_start_2"], lease_signing_date, today)
+    ls_cpf_1 = project_cpf_oa_with_interest(config["cpf_oa_1"], config["monthly_cpf_1"], ls_wm_1)
+    ls_cpf_2 = project_cpf_oa_with_interest(config["cpf_oa_2"], config["monthly_cpf_2"], ls_wm_2)
+    ls_cash_1 = project_cash_balance(config["cash_1"], config["monthly_cash_1"], ls_wm_1)
+    ls_cash_2 = project_cash_balance(config["cash_2"], config["monthly_cash_2"], ls_wm_2)
+    ls_half = phases.lease_signing_total / 2
+    ls_alloc = allocate_lease_signing_payment(
+        amount_needed=phases.lease_signing_total,
+        cpf_1=ls_cpf_1, cpf_2=ls_cpf_2,
+        cash_1=ls_cash_1, cash_2=ls_cash_2,
+        monthly_combined_savings=config["monthly_cpf"] + config["monthly_cash_savings"],
+    )
 
-        st.markdown("---")
+    # Your Resources
+    st.subheader("💰 Your Resources")
 
-        st.write(f"**Phase 2 — Key Collection ({phases.key_collection_pct:.1%}):**")
-        st.write(f"- Downpayment ({phases.key_collection_pct:.1%}): {format_currency(phases.key_collection_downpayment)}")
-        st.write(f"- + Legal Fees: {format_currency(phases.key_collection_legal_fees)}")
-        if phases.key_collection_loan_shortfall > 0:
-            st.write(f"- + Loan Shortfall: {format_currency(phases.key_collection_loan_shortfall)}")
-        st.write(f"- **= At Key Collection: {format_currency(phases.key_collection_total)}**")
+    at_comp_cpf_1_after = max(0.0, projected_cpf_1 - ls_alloc.cpf_contrib_1)
+    at_comp_cash_1_after = max(0.0, projected_cash_1 - ls_alloc.cash_contrib_1)
+    at_comp_cpf_2_after = max(0.0, projected_cpf_2 - ls_alloc.cpf_contrib_2)
+    at_comp_cash_2_after = max(0.0, projected_cash_2 - ls_alloc.cash_contrib_2)
 
-        st.markdown("---")
+    resources_data = {
+        "Scenario": [
+            f"At Lease Signing ({lease_signing_date.strftime('%b %Y')})",
+            f"At Completion ({config['completion_date'].strftime('%b %Y')})",
+            f"At Completion ({config['completion_date'].strftime('%b %Y')}) minus Lease Signing",
+        ],
+        "A1 CPF": [
+            format_currency(ls_cpf_1),
+            format_currency(projected_cpf_1),
+            format_currency(at_comp_cpf_1_after),
+        ],
+        "A1 Cash": [
+            format_currency(ls_cash_1),
+            format_currency(projected_cash_1),
+            format_currency(at_comp_cash_1_after),
+        ],
+        "A2 CPF": [
+            format_currency(ls_cpf_2),
+            format_currency(projected_cpf_2),
+            format_currency(at_comp_cpf_2_after),
+        ],
+        "A2 Cash": [
+            format_currency(ls_cash_2),
+            format_currency(projected_cash_2),
+            format_currency(at_comp_cash_2_after),
+        ],
+        "Combined": [
+            format_currency(ls_cpf_1 + ls_cash_1 + ls_cpf_2 + ls_cash_2),
+            format_currency(affordability.total_available),
+            format_currency(at_comp_cpf_1_after + at_comp_cash_1_after + at_comp_cpf_2_after + at_comp_cash_2_after),
+        ],
+    }
+    st.dataframe(pd.DataFrame(resources_data), hide_index=True)
+    with st.expander("ℹ️ How these projections are calculated"):
+        st.write(
+            "**CPF OA** is projected month-by-month: each month your contribution is added, "
+            "then 2.5% p.a. interest is applied (÷ 12 = 0.208%/month). "
+            "Contribution amount is based on salary and CPF tier."
+        )
+        st.write(
+            "**Cash** accumulates linearly: current balance + monthly savings × months to milestone. "
+            "No interest is assumed on cash savings."
+        )
+        st.write(
+            '**"At Completion minus Lease Signing"** is your completion balance minus the Phase 1 '
+            "costs already committed at lease signing — i.e. what remains available for Phase 2 (key collection)."
+        )
 
-        st.write(f"**Loan Amount:** {format_currency(phases.actual_loan)}")
-        st.write(f"- Max Loan Eligibility: {format_currency(eligibility.max_loan_amount)}")
-        loan_status = "✅ Within limit" if affordability.can_afford_loan else "❌ Exceeds limit"
-        st.write(f"- Loan Status: {loan_status}")
+    if not config.get("currently_working_1", True):
+        st.caption(f"A1 ⏳ starts work {config['work_start_1'].strftime('%b %Y')}")
+    if not config.get("currently_working_2", True):
+        st.caption(f"A2 ⏳ starts work {config['work_start_2'].strftime('%b %Y')}")
 
-        if phases.key_collection_loan_shortfall > 0:
-            st.warning(
-                f"⚠️ **Loan Shortfall: {format_currency(phases.key_collection_loan_shortfall)}**\n\n"
-                "Shortfall = Purchase Price − Downpayment Paid − Actual Loan − Grants"
+    st.markdown("---")
+
+    # What You Need
+    st.subheader("🏠 What You Need")
+    st.caption(f"Scheme: {phases.scheme_label}")
+
+    st.write(f"**Phase 1 — Lease Signing ({phases.lease_signing_pct:.1%}):**")
+    st.write(f"- Downpayment ({phases.lease_signing_pct:.1%}): {format_currency(phases.lease_signing_downpayment)}")
+    st.write(f"- + Stamp Duty (BSD): {format_currency(phases.lease_signing_stamp_duty)}")
+    st.write(f"- + Legal Fees: {format_currency(phases.lease_signing_legal_fees)}")
+    st.write(f"- **= At Lease Signing: {format_currency(phases.lease_signing_total)}**")
+
+    # Per-applicant lease signing split
+    st.caption(
+        f"Fair share per applicant: {format_currency(ls_half)} each"
+    )
+    a1_total_ls = ls_alloc.cpf_contrib_1 + ls_alloc.cash_contrib_1
+    a2_total_ls = ls_alloc.cpf_contrib_2 + ls_alloc.cash_contrib_2
+    ls_split_data = {
+        "": ["Applicant 1", "Applicant 2", "Total"],
+        "CPF OA": [
+            format_currency(ls_alloc.cpf_contrib_1),
+            format_currency(ls_alloc.cpf_contrib_2),
+            format_currency(ls_alloc.cpf_contrib_1 + ls_alloc.cpf_contrib_2),
+        ],
+        "Cash": [
+            format_currency(ls_alloc.cash_contrib_1),
+            format_currency(ls_alloc.cash_contrib_2),
+            format_currency(ls_alloc.cash_contrib_1 + ls_alloc.cash_contrib_2),
+        ],
+        "Total Paid": [
+            format_currency(a1_total_ls),
+            format_currency(a2_total_ls),
+            format_currency(a1_total_ls + a2_total_ls),
+        ],
+    }
+    st.dataframe(pd.DataFrame(ls_split_data), hide_index=True)
+    # Intermediates for step-by-step explanation
+    ls_cpf_equal_1 = min(ls_cpf_1, ls_half)
+    ls_cpf_equal_2 = min(ls_cpf_2, ls_half)
+    ls_cash_remaining = phases.lease_signing_total - ls_alloc.cpf_contrib_1 - ls_alloc.cpf_contrib_2
+    ls_cash_half = ls_cash_remaining / 2 if ls_cash_remaining > 0.01 else 0
+    with st.expander("ℹ️ How this split was calculated"):
+        st.write(
+            f"**Goal:** cover \\{format_currency(phases.lease_signing_total)} — fair share is {format_currency(ls_half)} each."
+        )
+        st.write(
+            f"**Step 1 — CPF equal split:** Each applicant pays up to their fair share using CPF OA first "
+            f"(CPF is drawn down before cash). "
+            f"A1 contributes \\{format_currency(ls_cpf_equal_1)} CPF, "
+            f"A2 contributes \\{format_currency(ls_cpf_equal_2)} CPF."
+        )
+        if ls_alloc.cpf_contrib_1 > ls_cpf_equal_1 + 0.01:
+            gap = ls_alloc.cpf_contrib_1 - ls_cpf_equal_1
+            st.write(
+                f"**Step 2 — CPF gap cover:** A2's CPF was short, so A1 covered "
+                f"\\{format_currency(gap)} extra from their remaining CPF."
             )
-
-        st.markdown("---")
-        if affordability.can_afford:
-            st.success(f"**You have a surplus of {format_currency(-affordability.downpayment_gap)}**")
+        elif ls_alloc.cpf_contrib_2 > ls_cpf_equal_2 + 0.01:
+            gap = ls_alloc.cpf_contrib_2 - ls_cpf_equal_2
+            st.write(
+                f"**Step 2 — CPF gap cover:** A1's CPF was short, so A2 covered "
+                f"\\{format_currency(gap)} extra from their remaining CPF."
+            )
         else:
-            st.error(f"**You need {format_currency(affordability.downpayment_gap)} more**")
+            st.write("**Step 2 — CPF gap cover:** Not needed — both had enough CPF for their share.")
+        if ls_cash_remaining > 0.01:
+            st.write(
+                f"**Step 3 — Cash equal split:** After CPF, \\{format_currency(ls_cash_remaining)} "
+                f"remains. Each pays up to \\{format_currency(ls_cash_half)} in cash."
+            )
+            ls_cash_equal_1 = min(ls_cash_1, ls_cash_half)
+            ls_cash_equal_2 = min(ls_cash_2, ls_cash_half)
+            if ls_alloc.cash_contrib_1 > ls_cash_equal_1 + 0.01:
+                gap = ls_alloc.cash_contrib_1 - ls_cash_equal_1
+                st.write(f"**Step 4 — Cash gap cover:** A2 was short in cash; A1 covered {format_currency(gap)} extra.")
+            elif ls_alloc.cash_contrib_2 > ls_cash_equal_2 + 0.01:
+                gap = ls_alloc.cash_contrib_2 - ls_cash_equal_2
+                st.write(f"**Step 4 — Cash gap cover:** A1 was short in cash; A2 covered {format_currency(gap)} extra.")
+            else:
+                st.write("**Step 4 — Cash gap cover:** Not needed.")
+        else:
+            st.write("**Step 3 — Cash:** CPF covered the full amount. No cash needed.")
+    if ls_alloc.shortfall > 0:
+        st.error(
+            f"Shortfall at lease signing: **\\{format_currency(ls_alloc.shortfall)}** "
+            f"(both applicants fully exhausted). "
+            f"Need ~{int(ls_alloc.months_to_close_shortfall)} more months of combined savings."
+        )
+    elif a1_total_ls > ls_half + 0.01:
+        st.info(f"A1 covers A2's gap of \\{format_currency(a1_total_ls - ls_half)}.")
+    elif a2_total_ls > ls_half + 0.01:
+        st.info(f"A2 covers A1's gap of \\{format_currency(a2_total_ls - ls_half)}.")
+
+    st.markdown("---")
+
+    st.write(f"**Phase 2 — Key Collection ({phases.key_collection_pct:.1%}):**")
+    st.write(f"- Downpayment ({phases.key_collection_pct:.1%}): \\{format_currency(phases.key_collection_downpayment)}")
+    if phases.key_collection_loan_shortfall > 0:
+        st.write(f"- + Loan Shortfall: \\{format_currency(phases.key_collection_loan_shortfall)}")
+    st.write(f"- **= At Key Collection: \\{format_currency(phases.key_collection_total)}**")
+
+    # Per-applicant key collection split (uses post-lease-signing balances at completion date)
+    kc_half = phases.key_collection_total / 2
+    kc_alloc = allocate_lease_signing_payment(
+        amount_needed=phases.key_collection_total,
+        cpf_1=at_comp_cpf_1_after, cpf_2=at_comp_cpf_2_after,
+        cash_1=at_comp_cash_1_after, cash_2=at_comp_cash_2_after,
+        monthly_combined_savings=config["monthly_cpf"] + config["monthly_cash_savings"],
+    )
+    st.caption(
+        f"Fair share per applicant: {format_currency(kc_half)} each"
+    )
+    a1_total_kc = kc_alloc.cpf_contrib_1 + kc_alloc.cash_contrib_1
+    a2_total_kc = kc_alloc.cpf_contrib_2 + kc_alloc.cash_contrib_2
+    kc_split_data = {
+        "": ["Applicant 1", "Applicant 2", "Total"],
+        "CPF OA": [
+            format_currency(kc_alloc.cpf_contrib_1),
+            format_currency(kc_alloc.cpf_contrib_2),
+            format_currency(kc_alloc.cpf_contrib_1 + kc_alloc.cpf_contrib_2),
+        ],
+        "Cash": [
+            format_currency(kc_alloc.cash_contrib_1),
+            format_currency(kc_alloc.cash_contrib_2),
+            format_currency(kc_alloc.cash_contrib_1 + kc_alloc.cash_contrib_2),
+        ],
+        "Total Paid": [
+            format_currency(a1_total_kc),
+            format_currency(a2_total_kc),
+            format_currency(a1_total_kc + a2_total_kc),
+        ],
+    }
+    st.dataframe(pd.DataFrame(kc_split_data), hide_index=True)
+    # Intermediates for step-by-step explanation
+    kc_cpf_equal_1 = min(at_comp_cpf_1_after, kc_half)
+    kc_cpf_equal_2 = min(at_comp_cpf_2_after, kc_half)
+    kc_cash_remaining = phases.key_collection_total - kc_alloc.cpf_contrib_1 - kc_alloc.cpf_contrib_2
+    kc_cash_half = kc_cash_remaining / 2 if kc_cash_remaining > 0.01 else 0
+    with st.expander("ℹ️ How this split was calculated"):
+        st.write(
+            f"**Note:** Balances used here are your *remaining* CPF and cash after Phase 1 (lease signing) costs were paid. "
+            f"Goal: cover \\{format_currency(phases.key_collection_total)} — fair share {format_currency(kc_half)} each."
+        )
+        st.write(
+            f"**Step 1 — CPF equal split:** Each applicant pays up to their fair share using CPF OA first. "
+            f"A1 contributes \\{format_currency(kc_cpf_equal_1)} CPF, "
+            f"A2 contributes \\{format_currency(kc_cpf_equal_2)} CPF."
+        )
+        if kc_alloc.cpf_contrib_1 > kc_cpf_equal_1 + 0.01:
+            gap = kc_alloc.cpf_contrib_1 - kc_cpf_equal_1
+            st.write(f"**Step 2 — CPF gap cover:** A2 short in CPF; A1 covered {format_currency(gap)} extra.")
+        elif kc_alloc.cpf_contrib_2 > kc_cpf_equal_2 + 0.01:
+            gap = kc_alloc.cpf_contrib_2 - kc_cpf_equal_2
+            st.write(f"**Step 2 — CPF gap cover:** A1 short in CPF; A2 covered {format_currency(gap)} extra.")
+        else:
+            st.write("**Step 2 — CPF gap cover:** Not needed.")
+        if kc_cash_remaining > 0.01:
+            st.write(
+                f"**Step 3 — Cash equal split:** Remaining \\{format_currency(kc_cash_remaining)} split equally → "
+                f"\\{format_currency(kc_cash_half)} each in cash."
+            )
+            kc_cash_equal_1 = min(at_comp_cash_1_after, kc_cash_half)
+            kc_cash_equal_2 = min(at_comp_cash_2_after, kc_cash_half)
+            if kc_alloc.cash_contrib_1 > kc_cash_equal_1 + 0.01:
+                gap = kc_alloc.cash_contrib_1 - kc_cash_equal_1
+                st.write(f"**Step 4 — Cash gap cover:** A2 short in cash; A1 covered {format_currency(gap)} extra.")
+            elif kc_alloc.cash_contrib_2 > kc_cash_equal_2 + 0.01:
+                gap = kc_alloc.cash_contrib_2 - kc_cash_equal_2
+                st.write(f"**Step 4 — Cash gap cover:** A1 short in cash; A2 covered {format_currency(gap)} extra.")
+            else:
+                st.write("**Step 4 — Cash gap cover:** Not needed.")
+        else:
+            st.write("**Step 3 — Cash:** CPF covered the full amount.")
+    if kc_alloc.shortfall > 0:
+        st.error(
+            f"Shortfall at key collection: **\\{format_currency(kc_alloc.shortfall)}** "
+            f"(both applicants fully exhausted). "
+            f"Need ~{int(kc_alloc.months_to_close_shortfall)} more months of combined savings."
+        )
+    elif a1_total_kc > kc_half + 0.01:
+        st.info(f"A1 covers A2's gap of {format_currency(a1_total_kc - kc_half)}.")
+    elif a2_total_kc > kc_half + 0.01:
+        st.info(f"A2 covers A1's gap of \\{format_currency(a2_total_kc - kc_half)}.")
+
+    st.markdown("---")
+
+    st.write(f"**Loan Amount:** \\{format_currency(phases.actual_loan)}")
+    st.write(f"- Max Loan Eligibility: \\{format_currency(eligibility.max_loan_amount)}")
+    loan_status = "✅ Within limit" if affordability.can_afford_loan else "❌ Exceeds limit"
+    st.write(f"- Loan Status: {loan_status}")
+
+    if phases.key_collection_loan_shortfall > 0:
+        st.warning(
+            f"⚠️ **Loan Shortfall: \\{format_currency(phases.key_collection_loan_shortfall)}**\n\n"
+            "Shortfall = Purchase Price − Downpayment Paid − Actual Loan − Grants"
+        )
+
+    st.markdown("---")
+    if affordability.can_afford:
+        st.success(f"**You have a surplus of \\{format_currency(-affordability.downpayment_gap)}**")
+    else:
+        st.error(f"**You need {format_currency(affordability.downpayment_gap)} more**")
     
     # Affordability breakdown chart
     st.subheader("📊 Visual Breakdown")
@@ -785,14 +1003,14 @@ def render_completion_tab(config: dict, eligibility):
             extra_monthly = extra_needed / months if months > 0 else extra_needed
             st.warning(
                 f"To afford the downpayment, you need to save an additional "
-                f"**{format_currency(extra_monthly)}/month** for the next {months} months."
+                f"**\\{format_currency(extra_monthly)}/month** for the next {months} months."
             )
         
         if not affordability.can_afford_loan:
             loan_gap = affordability.loan_amount - eligibility.max_loan_amount
             st.warning(
-                f"The loan required ({format_currency(affordability.loan_amount)}) exceeds your eligibility "
-                f"({format_currency(eligibility.max_loan_amount)}) by {format_currency(loan_gap)}. "
+                f"The loan required (\\{format_currency(affordability.loan_amount)}) exceeds your eligibility "
+                f"(\\{format_currency(eligibility.max_loan_amount)}) by {format_currency(loan_gap)}. "
                 "Consider a cheaper flat or increasing your income."
             )
     
@@ -1224,6 +1442,88 @@ def render_tenure_optimizer_tab(config: dict, eligibility):
             "Consider reducing the flat price or increasing your income."
         )
 
+    # -------------------------------------------------------------------------
+    # CPF Coverage Analysis
+    # -------------------------------------------------------------------------
+    st.markdown("---")
+    st.subheader("💰 CPF OA Coverage Analysis")
+    st.caption("Which tenures can be fully paid from your CPF OA — zero cash out of pocket each month")
+
+    combined_cpf_oa = calculate_combined_monthly_cpf_oa(
+        config["income_1"], config["age_1"],
+        config["income_2"], config["age_2"],
+    )
+
+    cash_needed_selected = max(0.0, monthly_payment - combined_cpf_oa)
+    cpf_covered_selected = cash_needed_selected == 0.0
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Combined Monthly CPF OA", format_currency(combined_cpf_oa))
+    with col2:
+        st.metric(
+            f"Mortgage ({selected_tenure}yr)",
+            format_currency(monthly_payment),
+            delta="✅ Fully CPF-covered" if cpf_covered_selected else f"🔴 +{format_currency(cash_needed_selected)} cash/month",
+            delta_color="normal" if cpf_covered_selected else "inverse",
+        )
+    with col3:
+        st.metric(
+            "Cash/Month Needed",
+            format_currency(cash_needed_selected),
+            delta="$0 cash" if cpf_covered_selected else None,
+        )
+
+    # Optimal CPF-match tenure (shortest tenure fully covered by CPF OA)
+    st.markdown("---")
+    st.subheader("🎯 Optimal CPF-Match Tenure")
+    st.caption("Shortest tenure where your entire mortgage is covered by CPF OA — maximises interest savings at zero cash cost")
+
+    all_tenures = generate_tenure_comparison(loan_amount, HDB_INTEREST_RATE)
+    cpf_covered_tenures = [t for t in all_tenures if t.monthly_payment <= combined_cpf_oa]
+
+    if cpf_covered_tenures:
+        best = min(cpf_covered_tenures, key=lambda t: t.tenure_years)
+        cpf_surplus = combined_cpf_oa - best.monthly_payment
+        st.success(
+            f"**{best.tenure_years}-year tenure — fully paid by CPF OA, $0 cash needed**\n\n"
+            f"- Monthly Mortgage: {format_currency(best.monthly_payment)}\n"
+            f"- Monthly CPF OA Available: {format_currency(combined_cpf_oa)}\n"
+            f"- CPF OA Surplus: {format_currency(cpf_surplus)} / month unspent\n"
+            f"- Total Interest: {format_currency(best.total_interest)}\n"
+            f"- Interest Saved vs 25 years: {format_currency(best.interest_saved_vs_max)}"
+        )
+    else:
+        shortfall_at_25 = monthly_payment - combined_cpf_oa  # monthly_payment here is 25yr (slider may differ)
+        payment_at_25 = calculate_monthly_payment(loan_amount, HDB_INTEREST_RATE, 25)
+        shortfall_at_25 = payment_at_25 - combined_cpf_oa
+        st.warning(
+            f"⚠️ No tenure option is fully covered by CPF OA alone.\n\n"
+            f"Even at 25 years, the monthly mortgage ({format_currency(payment_at_25)}) "
+            f"exceeds your combined CPF OA ({format_currency(combined_cpf_oa)}) "
+            f"by **{format_currency(shortfall_at_25)}/month**.\n\n"
+            f"To reach zero cash, you would need CPF OA contributions of at least "
+            f"{format_currency(payment_at_25)}/month combined."
+        )
+
+    # Full tenure-by-tenure CPF coverage table
+    st.markdown("---")
+    st.subheader("📋 CPF Coverage by Tenure")
+
+    coverage_rows = []
+    for t in all_tenures:
+        cash = max(0.0, t.monthly_payment - combined_cpf_oa)
+        coverage_rows.append({
+            "Tenure (yrs)": t.tenure_years,
+            "Monthly Mortgage": format_currency(t.monthly_payment),
+            "CPF OA / Month": format_currency(combined_cpf_oa),
+            "Cash / Month": format_currency(cash),
+            "Total Interest": format_currency(t.total_interest),
+            "Status": "✅ No cash" if cash == 0.0 else "🔴 Cash needed",
+        })
+
+    st.dataframe(pd.DataFrame(coverage_rows), hide_index=True, width="stretch")
+
 
 # =============================================================================
 # TAB 6: EHG VS LOAN TIMING
@@ -1311,10 +1611,13 @@ def render_timing_tab(config: dict):
     timing_stamp_duty = calculate_stamp_duty(config["target_price"])
     timing_legal_fee_purchase = calculate_hdb_legal_fees(config["target_price"])
     optimal_legal_fees = timing_legal_fee_purchase + calculate_hdb_legal_fees(optimal.max_hdb_loan)
-    optimal_lease_signing = config["target_price"] * timing_scheme_info["lease_signing_pct"] + timing_stamp_duty
+    optimal_lease_signing = (
+        config["target_price"] * timing_scheme_info["lease_signing_pct"]
+        + timing_stamp_duty
+        + optimal_legal_fees
+    )
     optimal_key_collection = (
         config["target_price"] * timing_scheme_info["key_collection_pct"]
-        + optimal_legal_fees
         + optimal.loan_shortfall
         - optimal.ehg_amount
     )
@@ -1331,6 +1634,22 @@ def render_timing_tab(config: dict):
     with col5:
         st.metric("Assessed Income", format_currency(optimal.assessed_income))
 
+    # Per-applicant CPF/cash split for optimal month's lease signing
+    opt_lease_signing_date = optimal.application_date + relativedelta(months=LEASE_SIGNING_OFFSET_MONTHS)
+    opt_ls_wm_1 = calculate_effective_working_months(config["work_start_1"], opt_lease_signing_date, today)
+    opt_ls_wm_2 = calculate_effective_working_months(config["work_start_2"], opt_lease_signing_date, today)
+    opt_ls_cpf_1 = project_cpf_oa_with_interest(config["cpf_oa_1"], config["monthly_cpf_1"], opt_ls_wm_1)
+    opt_ls_cpf_2 = project_cpf_oa_with_interest(config["cpf_oa_2"], config["monthly_cpf_2"], opt_ls_wm_2)
+    opt_ls_cash_1 = project_cash_balance(config["cash_1"], config["monthly_cash_1"], opt_ls_wm_1)
+    opt_ls_cash_2 = project_cash_balance(config["cash_2"], config["monthly_cash_2"], opt_ls_wm_2)
+    opt_monthly_savings = config["monthly_cpf"] + config["monthly_cash_savings"]
+    opt_alloc = allocate_lease_signing_payment(
+        amount_needed=optimal_lease_signing,
+        cpf_1=opt_ls_cpf_1, cpf_2=opt_ls_cpf_2,
+        cash_1=opt_ls_cash_1, cash_2=opt_ls_cash_2,
+        monthly_combined_savings=opt_monthly_savings,
+    )
+
     st.markdown("---")
 
     # Comparison table for key months
@@ -1341,13 +1660,29 @@ def render_timing_tab(config: dict):
     for i in key_indices:
         p = series[i]
         row_legal_fees = timing_legal_fee_purchase + calculate_hdb_legal_fees(p.max_hdb_loan)
-        at_lease_signing = config["target_price"] * timing_scheme_info["lease_signing_pct"] + timing_stamp_duty
+        at_lease_signing = (
+            config["target_price"] * timing_scheme_info["lease_signing_pct"]
+            + timing_stamp_duty
+            + row_legal_fees
+        )
         at_key_collection = (
             config["target_price"] * timing_scheme_info["key_collection_pct"]
-            + row_legal_fees
             + p.loan_shortfall
             - p.ehg_amount
         )
+        row_ls_date = p.application_date + relativedelta(months=LEASE_SIGNING_OFFSET_MONTHS)
+        row_wm_1 = calculate_effective_working_months(config["work_start_1"], row_ls_date, today)
+        row_wm_2 = calculate_effective_working_months(config["work_start_2"], row_ls_date, today)
+        row_cpf_1 = project_cpf_oa_with_interest(config["cpf_oa_1"], config["monthly_cpf_1"], row_wm_1)
+        row_cpf_2 = project_cpf_oa_with_interest(config["cpf_oa_2"], config["monthly_cpf_2"], row_wm_2)
+        row_cash_1 = project_cash_balance(config["cash_1"], config["monthly_cash_1"], row_wm_1)
+        row_cash_2 = project_cash_balance(config["cash_2"], config["monthly_cash_2"], row_wm_2)
+        # row_alloc = allocate_lease_signing_payment(
+        #     amount_needed=at_lease_signing,
+        #     cpf_1=row_cpf_1, cpf_2=row_cpf_2,
+        #     cash_1=row_cash_1, cash_2=row_cash_2,
+        #     monthly_combined_savings=config["monthly_cpf"] + config["monthly_cash_savings"],
+        # )
         table_data.append({
             "Month": p.application_date.strftime("%b %Y"),
             "Assessed Income": format_currency(p.assessed_income),
@@ -1355,8 +1690,12 @@ def render_timing_tab(config: dict):
             "Max HDB Loan": format_currency(p.max_hdb_loan),
             "Loan Shortfall": format_currency(p.loan_shortfall) if p.loan_shortfall > 0 else "—",
             "At Lease Signing": format_currency(at_lease_signing),
+            # "A1 CPF": format_currency(row_alloc.cpf_contrib_1),
+            # "A1 Cash": format_currency(row_alloc.cash_contrib_1),
+            # "A2 CPF": format_currency(row_alloc.cpf_contrib_2),
+            # "A2 Cash": format_currency(row_alloc.cash_contrib_2),
             "At Key Collection": format_currency(at_key_collection),
-            "CPF/Cash Needed": format_currency(p.cash_needed),
+            "Total CPF/Cash": format_currency(p.cash_needed),
             "EHG Eligible": "✅" if p.ehg_eligible else "❌",
             "": "⭐" if i == optimal_index else "",
         })
