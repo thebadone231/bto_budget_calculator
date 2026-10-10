@@ -46,8 +46,13 @@ jobs:
               except Exception:
                   print("App was already awake")
 
-              # Wait for the Streamlit app container to render
-              page.wait_for_selector('[data-testid="stApp"]', timeout=120_000)
+              # Community Cloud renders the app inside an iframe, so look in every frame
+              for _ in range(60):
+                  if any(f.locator('[data-testid="stApp"]').count() for f in page.frames):
+                      break
+                  page.wait_for_timeout(2_000)
+              else:
+                  sys.exit("Streamlit app did not render within 120s")
               page.wait_for_timeout(5_000)
               print("App loaded:", page.title())
               browser.close()
