@@ -1,0 +1,54 @@
+name: Keep Streamlit app alive
+
+on:
+  schedule:
+    # Every 6 hours (Streamlit sleeps apps after ~12h of no traffic)
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Visit app (wakes it if sleeping)
+        env:
+          APP_URL: ${{ vars.STREAMLIT_APP_URL }}
+        run: |
+          python - <<'EOF'
+          import os, sys
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ["APP_URL"]
+          if not url:
+              sys.exit("Repo variable STREAMLIT_APP_URL is not set")
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+              page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+
+              # If the app is asleep, click the wake-up button
+              wake = page.get_by_role("button", name="Yes, get this app back up!")
+              try:
+                  wake.wait_for(timeout=10_000)
+                  wake.click()
+                  print("App was asleep, clicked wake-up button")
+              except Exception:
+                  print("App was already awake")
+
+              # Wait for the Streamlit app container to render
+              page.wait_for_selector('[data-testid="stApp"]', timeout=120_000)
+              page.wait_for_timeout(5_000)
+              print("App loaded:", page.title())
+              browser.close()
+          EOF
